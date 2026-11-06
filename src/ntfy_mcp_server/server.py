@@ -10,9 +10,10 @@ import logging
 import os
 from typing import Any
 
-import mcp.server.stdio
+import jsonschema
 import mcp.types as types
-from mcp.server import Server
+from mcp.server import Server, ServerRequestContext
+from mcp.server.stdio import stdio_server
 
 _log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -22,20 +23,6 @@ logging.basicConfig(
 
 from . import client  # noqa: E402
 
-server = Server(
-    "ntfy-mcp-server",
-    instructions=(
-        "MCP-Server für selbst gehostetes ntfy.sh. "
-        "Tools:\n"
-        "- ntfy_send: Push-Notification an ein Topic senden\n"
-        "- ntfy_send_with_actions: mit Action-Buttons (URL, HTTP, View)\n"
-        "- ntfy_get_messages: gecachte Messages eines Topics holen\n"
-        "- ntfy_list_topics: Topics auflisten, auf die der Token Zugriff hat"
-    ),
-)
-
-
-@server.list_tools()
 async def list_tools() -> list[types.Tool]:
     return [
         types.Tool(
@@ -44,7 +31,7 @@ async def list_tools() -> list[types.Tool]:
                 "Sendet eine Push-Notification an ein ntfy-Topic. "
                 "Verwendet die JSON-Publish-API."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "topic": {
@@ -111,7 +98,7 @@ async def list_tools() -> list[types.Tool]:
                 "Action-Typen: 'view' (öffnet URL), 'http' (sendet HTTP-Request), "
                 "'broadcast' (Android Intent)."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "topic": {"type": "string"},
@@ -155,7 +142,7 @@ async def list_tools() -> list[types.Tool]:
                 "Streaming). Mit `since=10m` letzte 10 Minuten, `since=1h` "
                 "letzte Stunde, `since=all` alle gecachten."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "topic": {"type": "string"},
@@ -182,12 +169,11 @@ async def list_tools() -> list[types.Tool]:
                 "Gibt das Account-Profil zurück inkl. der Zugriffsrechte (welche "
                 "Topics darf der konfigurierte Token lesen/schreiben)."
             ),
-            inputSchema={"type": "object", "properties": {}},
+            input_schema={"type": "object", "properties": {}},
         ),
     ]
 
 
-@server.call_tool()
 async def call_tool(
     name: str, arguments: dict[str, Any]
 ) -> list[types.TextContent]:
@@ -235,13 +221,65 @@ async def _dispatch(name: str, args: dict[str, Any]) -> Any:
     raise ValueError(f"Unbekanntes Tool: {name}")
 
 
+async def _on_list_tools(
+    ctx: ServerRequestContext, params: types.PaginatedRequestParams | None
+) -> types.ListToolsResult:
+    return types.ListToolsResult(tools=await list_tools())
+
+
+def _error_result(text: str) -> types.CallToolResult:
+    return types.CallToolResult(
+        content=[types.TextContent(type="text", text=text)], is_error=True
+    )
+
+
+async def _on_call_tool(
+    ctx: ServerRequestContext, params: types.CallToolRequestParams
+) -> types.CallToolResult:
+    """mcp 2.x prueft Argumente nicht mehr und wandelt Exceptions nicht mehr um."""
+    arguments = params.arguments or {}
+    tool = next((t for t in await list_tools() if t.name == params.name), None)
+    if tool is not None:
+        try:
+            jsonschema.validate(arguments, tool.input_schema)
+        except jsonschema.ValidationError as exc:
+            return _error_result(f"Input validation error: {exc.message}")
+    try:
+        content = await call_tool(params.name, arguments)
+    except Exception as exc:
+        return _error_result(str(exc))
+    return types.CallToolResult(content=content, is_error=False)
+
+
+server = Server(
+    "ntfy-mcp-server",
+    instructions=(
+        "MCP-Server für selbst gehostetes ntfy.sh. "
+        "Tools:\n"
+        "- ntfy_send: Push-Notification an ein Topic senden\n"
+        "- ntfy_send_with_actions: mit Action-Buttons (URL, HTTP, View)\n"
+        "- ntfy_get_messages: gecachte Messages eines Topics holen\n"
+        "- ntfy_list_topics: Topics auflisten, auf die der Token Zugriff hat"
+    ),
+    on_list_tools=_on_list_tools,
+    on_call_tool=_on_call_tool,
+)
+
+
 def main() -> None:
     import asyncio
 
     if os.getenv("MCP_TRANSPORT", "stdio") == "sse":
         _run_sse()
     else:
-        asyncio.run(mcp.server.stdio.run_server(server))
+        asyncio.run(_run_stdio())
+
+
+async def _run_stdio() -> None:
+    async with stdio_server() as (read_stream, write_stream):
+        await server.run(
+            read_stream, write_stream, server.create_initialization_options()
+        )
 
 
 def _run_sse() -> None:
